@@ -68,28 +68,41 @@ func (a *API) sendPhoneConfirmation(ctx context.Context, tx *storage.Connection,
 		return "", internalServerError("invalid otp type")
 	}
 
+	// intentionally keeping this before the test OTP, so that the behavior
+	// of regular and test OTPs is similar
 	if sentAt != nil && !sentAt.Add(config.Sms.MaxFrequency).Before(time.Now()) {
 		return "", MaxFrequencyLimitError
 	}
-	oldToken := *token
-	otp, err := crypto.GenerateOtp(config.Sms.OtpLength)
-	if err != nil {
-		return "", internalServerError("error generating otp").WithInternalError(err)
+
+	var otp, messageID string
+
+	if config.External.Phone.Enabled && config.External.Phone.TestOTP != nil {
+		if testOTP, ok := config.External.Phone.TestOTP[phone]; ok && testOTP != "" {
+			otp = testOTP
+			messageID = "test-otp"
+		}
 	}
+
+	if otp == "" { // not using test OTPs
+		otp, err := crypto.GenerateOtp(config.Sms.OtpLength)
+		if err != nil {
+			return "", internalServerError("error generating otp").WithInternalError(err)
+		}
+
+		var message string
+		if config.Sms.Template == "" {
+			message = fmt.Sprintf(defaultSmsMessage, otp)
+		} else {
+			message = strings.Replace(config.Sms.Template, "{{ .Code }}", otp, -1)
+		}
+
+		messageID, err = smsProvider.SendMessage(phone, message, channel)
+		if err != nil {
+			return messageID, err
+		}
+	}
+
 	*token = fmt.Sprintf("%x", sha256.Sum224([]byte(phone+otp)))
-
-	var message string
-	if config.Sms.Template == "" {
-		message = fmt.Sprintf(defaultSmsMessage, otp)
-	} else {
-		message = strings.Replace(config.Sms.Template, "{{ .Code }}", otp, -1)
-	}
-
-	messageID, serr := smsProvider.SendMessage(phone, message, channel)
-	if serr != nil {
-		*token = oldToken
-		return messageID, serr
-	}
 
 	now := time.Now()
 

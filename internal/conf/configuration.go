@@ -193,6 +193,8 @@ type MailerConfiguration struct {
 
 type PhoneProviderConfiguration struct {
 	Enabled bool `json:"enabled" default:"false"`
+
+	TestOTP map[string]string `json:"test_otp" split_words:"true"`
 }
 
 type SmsProviderConfiguration struct {
