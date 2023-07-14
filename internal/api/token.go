@@ -36,6 +36,7 @@ type AccessTokenResponse struct {
 	Token                string       `json:"access_token"`
 	TokenType            string       `json:"token_type"` // Bearer
 	ExpiresIn            int          `json:"expires_in"`
+	ExpiresAt            int64        `json:"expires_at"`
 	RefreshToken         string       `json:"refresh_token"`
 	User                 *models.User `json:"user"`
 	ProviderAccessToken  string       `json:"provider_token,omitempty"`
@@ -48,6 +49,7 @@ func (r *AccessTokenResponse) AsRedirectURL(redirectURL string, extraParams url.
 	extraParams.Set("access_token", r.Token)
 	extraParams.Set("token_type", r.TokenType)
 	extraParams.Set("expires_in", strconv.Itoa(r.ExpiresIn))
+	extraParams.Set("expires_at", strconv.FormatInt(r.ExpiresAt, 10))
 	extraParams.Set("refresh_token", r.RefreshToken)
 
 	return redirectURL + "#" + extraParams.Encode()
@@ -252,6 +254,7 @@ func (a *API) RefreshTokenGrant(ctx context.Context, w http.ResponseWriter, r *h
 	}
 
 	var tokenString string
+	var expiresAt int64
 	var newTokenResponse *AccessTokenResponse
 
 	err = db.Transaction(func(tx *storage.Connection) error {
@@ -268,7 +271,7 @@ func (a *API) RefreshTokenGrant(ctx context.Context, w http.ResponseWriter, r *h
 			return terr
 		}
 
-		tokenString, terr = generateAccessToken(tx, user, newToken.SessionId, &config.JWT)
+		tokenString, expiresAt, terr = generateAccessToken(tx, user, newToken.SessionId, &config.JWT)
 
 		if terr != nil {
 			return internalServerError("error generating jwt token").WithInternalError(terr)
@@ -278,6 +281,7 @@ func (a *API) RefreshTokenGrant(ctx context.Context, w http.ResponseWriter, r *h
 			Token:        tokenString,
 			TokenType:    "bearer",
 			ExpiresIn:    config.JWT.Exp,
+			ExpiresAt:    expiresAt,
 			RefreshToken: newToken.Token,
 			User:         user,
 		}
@@ -366,29 +370,30 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 
 }
 
-func generateAccessToken(tx *storage.Connection, user *models.User, sessionId *uuid.UUID, config *conf.JWTConfiguration) (string, error) {
+func generateAccessToken(tx *storage.Connection, user *models.User, sessionId *uuid.UUID, config *conf.JWTConfiguration) (string, int64, error) {
 	aal, amr := models.AAL1.String(), []models.AMREntry{}
 	sid := ""
 	if sessionId != nil {
 		sid = sessionId.String()
 		session, terr := models.FindSessionByID(tx, *sessionId)
 		if terr != nil {
-			return "", terr
+			return "", 0, terr
 		}
 		aal, amr, terr = session.CalculateAALAndAMR(tx)
 		if terr != nil {
-			return "", terr
+			return "", 0, terr
 		}
 	}
 
 	issuedAt := time.Now().UTC()
+	expiresAt := issuedAt.Add(time.Second * time.Duration(config.Exp)).Unix()
 
 	claims := &GoTrueClaims{
 		StandardClaims: jwt.StandardClaims{
 			Subject:   user.ID.String(),
 			Audience:  user.Aud,
 			IssuedAt:  issuedAt.Unix(),
-			ExpiresAt: issuedAt.Add(time.Second * time.Duration(config.Exp)).Unix(),
+			ExpiresAt: expiresAt,
 			Issuer:    config.Issuer,
 		},
 		Email:                         user.GetEmail(),
@@ -411,7 +416,12 @@ func generateAccessToken(tx *storage.Connection, user *models.User, sessionId *u
 		token.Header["kid"] = config.KeyID
 	}
 
-	return token.SignedString([]byte(config.Secret))
+	signed, err := token.SignedString([]byte(config.Secret))
+	if err != nil {
+		return "", 0, err
+	}
+
+	return signed, expiresAt, nil
 }
 
 func (a *API) issueRefreshToken(ctx context.Context, conn *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*AccessTokenResponse, error) {
@@ -421,6 +431,7 @@ func (a *API) issueRefreshToken(ctx context.Context, conn *storage.Connection, u
 	user.LastSignInAt = &now
 
 	var tokenString string
+	var expiresAt int64
 	var refreshToken *models.RefreshToken
 
 	err := conn.Transaction(func(tx *storage.Connection) error {
@@ -440,7 +451,7 @@ func (a *API) issueRefreshToken(ctx context.Context, conn *storage.Connection, u
 			return terr
 		}
 
-		tokenString, terr = generateAccessToken(tx, user, refreshToken.SessionId, &config.JWT)
+		tokenString, expiresAt, terr = generateAccessToken(tx, user, refreshToken.SessionId, &config.JWT)
 		if terr != nil {
 			return internalServerError("error generating jwt token").WithInternalError(terr)
 		}
@@ -454,6 +465,7 @@ func (a *API) issueRefreshToken(ctx context.Context, conn *storage.Connection, u
 		Token:        tokenString,
 		TokenType:    "bearer",
 		ExpiresIn:    config.JWT.Exp,
+		ExpiresAt:    expiresAt,
 		RefreshToken: refreshToken.Token,
 		User:         user,
 	}, nil
@@ -463,6 +475,7 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 	ctx := r.Context()
 	config := a.config
 	var tokenString string
+	var expiresAt int64
 	var refreshToken *models.RefreshToken
 	currentClaims := getClaims(ctx)
 	sessionId, err := uuid.FromString(currentClaims.SessionId)
@@ -503,7 +516,7 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 			return err
 		}
 
-		tokenString, terr = generateAccessToken(tx, user, &sessionId, &config.JWT)
+		tokenString, expiresAt, terr = generateAccessToken(tx, user, &sessionId, &config.JWT)
 
 		if terr != nil {
 			return internalServerError("error generating jwt token").WithInternalError(terr)
@@ -517,6 +530,7 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 		Token:        tokenString,
 		TokenType:    "bearer",
 		ExpiresIn:    config.JWT.Exp,
+		ExpiresAt:    expiresAt,
 		RefreshToken: refreshToken.Token,
 		User:         user,
 	}, nil
